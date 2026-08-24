@@ -208,7 +208,7 @@ fn draw_input(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         ))
     } else {
         Line::from(Span::styled(
-            format!(" {}", &app.input),
+            format!(" {}", app.input),
             Style::default().fg(WHITE),
         ))
     };
@@ -221,7 +221,9 @@ fn draw_input(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     );
 
     if focused {
-        let x = area.x + app.cursor_position as u16 + 2;
+        let cursor = app.cursor_position.min(app.input.len());
+        let prefix_width = unicode_width::UnicodeWidthStr::width(&app.input[..cursor]);
+        let x = area.x + prefix_width as u16 + 2;
         let y = area.y + 1;
         frame.set_cursor_position((x, y));
     }

@@ -4,7 +4,39 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
+use time::OffsetDateTime;
 use tokio::sync::mpsc;
+
+fn timestamp() -> String {
+    let now = OffsetDateTime::now_local().unwrap_or_else(|_| OffsetDateTime::now_utc());
+    format!(
+        "[{:02}:{:02}:{:02}]",
+        now.hour(),
+        now.minute(),
+        now.second()
+    )
+}
+
+/// Byte index of the char boundary strictly before `pos` (or 0).
+fn move_left(s: &str, pos: usize) -> usize {
+    if pos == 0 {
+        return 0;
+    }
+    let mut p = pos - 1;
+    while !s.is_char_boundary(p) {
+        p -= 1;
+    }
+    p
+}
+
+/// Byte index of the char boundary strictly after `pos` (or s.len()).
+fn move_right(s: &str, pos: usize) -> usize {
+    let mut p = (pos + 1).min(s.len());
+    while p < s.len() && !s.is_char_boundary(p) {
+        p += 1;
+    }
+    p
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum NetworkMode {
@@ -97,6 +129,7 @@ pub struct App {
     pub should_quit: bool,
     pub proxy_addr: String,
     pub output_dir: PathBuf,
+    pub verbose: bool,
     pub progress_rx: Option<mpsc::UnboundedReceiver<DownloadProgress>>,
     pub progress_tx: mpsc::UnboundedSender<DownloadProgress>,
     pub download_scroll: u16,
@@ -108,7 +141,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(proxy_addr: String, output_dir: PathBuf) -> Self {
+    pub fn new(proxy_addr: String, output_dir: PathBuf, verbose: bool) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         Self {
             mode: AppMode::Idle,
@@ -122,6 +155,7 @@ impl App {
             should_quit: false,
             proxy_addr,
             output_dir,
+            verbose,
             progress_rx: Some(rx),
             progress_tx: tx,
             download_scroll: 0,
@@ -134,15 +168,7 @@ impl App {
     }
 
     pub fn add_log(&mut self, msg: &str) {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let h = (now / 3600) % 24;
-        let m = (now / 60) % 60;
-        let s = now % 60;
-        self.log_messages
-            .push(format!("[{:02}:{:02}:{:02}] {}", h, m, s, msg));
+        self.log_messages.push(format!("{} {}", timestamp(), msg));
 
         if self.log_messages.len() > 200 {
             self.log_messages.remove(0);
@@ -289,24 +315,30 @@ impl App {
             KeyCode::Esc => Action::Quit,
             KeyCode::Backspace => {
                 if self.cursor_position > 0 {
-                    self.cursor_position -= 1;
-                    self.input.remove(self.cursor_position);
+                    let new_pos = move_left(&self.input, self.cursor_position);
+                    self.input
+                        .replace_range(new_pos..self.cursor_position.min(self.input.len()), "");
+                    self.cursor_position = new_pos;
                 }
                 Action::None
             }
             KeyCode::Left => {
-                self.cursor_position = self.cursor_position.saturating_sub(1);
+                self.cursor_position = move_left(&self.input, self.cursor_position);
                 Action::None
             }
             KeyCode::Right => {
-                if self.cursor_position < self.input.len() {
-                    self.cursor_position += 1;
-                }
+                self.cursor_position = move_right(&self.input, self.cursor_position);
                 Action::None
             }
             KeyCode::Char(c) => {
-                self.input.insert(self.cursor_position, c);
-                self.cursor_position += 1;
+                let pos = self.cursor_position.min(self.input.len());
+                let pos = if self.input.is_char_boundary(pos) {
+                    pos
+                } else {
+                    move_left(&self.input, pos)
+                };
+                self.input.insert(pos, c);
+                self.cursor_position = pos + c.len_utf8();
                 Action::None
             }
             _ => Action::None,
@@ -471,6 +503,11 @@ impl App {
                     self.add_log(&format!("❌ Failed: {}", error));
                     self.check_mode_idle();
                 }
+                DownloadProgress::Verbose { message } => {
+                    if self.verbose {
+                        self.add_log(&message);
+                    }
+                }
             }
         }
     }
@@ -486,36 +523,24 @@ impl App {
     }
 
     pub fn pause_download(&mut self, id: usize) {
-        if id < self.downloads.len() {
-            let filename = {
-                let dl = &mut self.downloads[id];
-                if dl.status == DownloadStatus::InProgress {
-                    dl.paused.store(true, Ordering::Relaxed);
-                    dl.status = DownloadStatus::Paused;
-                    dl.speed_bps = 0.0;
-                }
-                dl.filename.clone()
-            };
-            let dl_status = self.downloads[id].status.clone();
-            if dl_status == DownloadStatus::Paused {
+        if let Some(dl) = self.downloads.get_mut(id) {
+            if dl.status == DownloadStatus::InProgress {
+                dl.paused.store(true, Ordering::Relaxed);
+                dl.status = DownloadStatus::Paused;
+                dl.speed_bps = 0.0;
+                let filename = dl.filename.clone();
                 self.add_log(&format!("⏸️ Paused: {}", filename));
             }
         }
     }
 
     pub fn resume_download(&mut self, id: usize) {
-        if id < self.downloads.len() {
-            let filename = {
-                let dl = &mut self.downloads[id];
-                if dl.status == DownloadStatus::Paused {
-                    dl.paused.store(false, Ordering::Relaxed);
-                    dl.status = DownloadStatus::InProgress;
-                    dl.last_update = Instant::now();
-                }
-                dl.filename.clone()
-            };
-            let dl_status = self.downloads[id].status.clone();
-            if dl_status == DownloadStatus::InProgress {
+        if let Some(dl) = self.downloads.get_mut(id) {
+            if dl.status == DownloadStatus::Paused {
+                dl.paused.store(false, Ordering::Relaxed);
+                dl.status = DownloadStatus::InProgress;
+                dl.last_update = Instant::now();
+                let filename = dl.filename.clone();
                 self.add_log(&format!("▶️ Resumed: {}", filename));
             }
         }
@@ -535,5 +560,142 @@ pub fn format_bytes(bytes: u64) -> String {
         format!("{:.1} KB", bytes as f64 / KB as f64)
     } else {
         format!("{} B", bytes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::KeyModifiers;
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn type_string(app: &mut App, s: &str) {
+        for c in s.chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+    }
+
+    #[test]
+    fn multibyte_backspace_does_not_panic_and_edits_correctly() {
+        let mut app = App::new(
+            "socks5h://127.0.0.1:9050".into(),
+            PathBuf::from("/tmp"),
+            false,
+        );
+        type_string(&mut app, "aé🧅b");
+        assert_eq!(app.input, "aé🧅b");
+        assert_eq!(app.cursor_position, "aé🧅b".len());
+
+        app.handle_key(key(KeyCode::Backspace));
+        assert_eq!(app.input, "aé🧅");
+        assert_eq!(app.cursor_position, "aé🧅".len());
+
+        app.handle_key(key(KeyCode::Backspace));
+        assert_eq!(app.input, "aé");
+        assert_eq!(app.cursor_position, "aé".len());
+    }
+
+    #[test]
+    fn arrow_keys_move_by_character_not_byte() {
+        let mut app = App::new(String::new(), PathBuf::from("/tmp"), false);
+        type_string(&mut app, "éx");
+
+        app.handle_key(key(KeyCode::Left));
+        assert_eq!(app.cursor_position, "é".len()); // before 'x'
+        app.handle_key(key(KeyCode::Left));
+        assert_eq!(app.cursor_position, 0);
+        app.handle_key(key(KeyCode::Right));
+        assert_eq!(app.cursor_position, "é".len());
+        app.handle_key(key(KeyCode::Right));
+        assert_eq!(app.cursor_position, "éx".len());
+    }
+
+    #[test]
+    fn insert_in_middle_of_multibyte_text() {
+        let mut app = App::new(String::new(), PathBuf::from("/tmp"), false);
+        type_string(&mut app, "héy");
+        app.handle_key(key(KeyCode::Left)); // between é and y
+        type_string(&mut app, "Z");
+        assert_eq!(app.input, "héZy");
+    }
+
+    #[test]
+    fn backspace_at_start_is_noop() {
+        let mut app = App::new(String::new(), PathBuf::from("/tmp"), false);
+        type_string(&mut app, "abc");
+        for _ in 0..5 {
+            app.handle_key(key(KeyCode::Left));
+        }
+        assert_eq!(app.cursor_position, 0);
+        app.handle_key(key(KeyCode::Backspace));
+        assert_eq!(app.input, "abc");
+    }
+
+    #[test]
+    fn verbose_messages_logged_only_when_verbose() {
+        let mut quiet = App::new(String::new(), PathBuf::from("/tmp"), false);
+        let mut loud = App::new(String::new(), PathBuf::from("/tmp"), true);
+
+        let _ = quiet.progress_tx.send(DownloadProgress::Verbose {
+            message: "detail".into(),
+        });
+        let _ = loud.progress_tx.send(DownloadProgress::Verbose {
+            message: "detail".into(),
+        });
+
+        let before_quiet = quiet.log_messages.len();
+        let before_loud = loud.log_messages.len();
+
+        quiet.process_progress();
+        loud.process_progress();
+
+        assert_eq!(quiet.log_messages.len(), before_quiet);
+        assert_eq!(loud.log_messages.len(), before_loud + 1);
+    }
+
+    #[test]
+    fn format_bytes_units() {
+        assert_eq!(format_bytes(512), "512 B");
+        assert_eq!(format_bytes(2048), "2.0 KB");
+        assert_eq!(format_bytes(5 * 1024 * 1024), "5.0 MB");
+        assert_eq!(format_bytes(3 * 1024 * 1024 * 1024), "3.0 GB");
+    }
+
+    #[test]
+    fn move_left_right_respect_boundaries() {
+        let s = "aé🧅";
+        assert_eq!(move_left(s, s.len()), "aé".len());
+        assert_eq!(move_left(s, 0), 0);
+        assert_eq!(move_right(s, 0), 1);
+        assert_eq!(move_right(s, s.len()), s.len());
+    }
+
+    #[test]
+    fn timestamp_is_formatted_with_brackets() {
+        let ts = timestamp();
+        assert!(ts.starts_with('[') && ts.ends_with(']'));
+        assert_eq!(ts.len(), 10);
+    }
+
+    #[test]
+    fn pause_resume_updates_status_and_logs_once() {
+        let mut app = App::new(String::new(), PathBuf::from("/tmp"), false);
+        let id = app.start_download("http://x.onion/file.zip", NetworkMode::Tor, 16);
+
+        let logs_before = app.log_messages.len();
+        app.pause_download(id);
+        assert_eq!(app.downloads[id].status, DownloadStatus::Paused);
+        assert_eq!(app.log_messages.len(), logs_before + 1);
+
+        let logs_before = app.log_messages.len();
+        // Pausing an already-paused download must not log again.
+        app.pause_download(id);
+        assert_eq!(app.log_messages.len(), logs_before);
+
+        app.resume_download(id);
+        assert_eq!(app.downloads[id].status, DownloadStatus::InProgress);
     }
 }

@@ -7,7 +7,6 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 use std::io;
 use std::panic;
 use std::time::Duration;
-// Removed unused mpsc
 
 mod app;
 mod banner;
@@ -44,7 +43,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut terminal = Terminal::new(backend)?;
 
     // ── Create app state ───────────────────────────
-    let mut app = App::new(config.proxy.clone(), config.output_dir.clone());
+    let mut app = App::new(
+        config.proxy.clone(),
+        config.output_dir.clone(),
+        config.verbose,
+    );
 
     // ── Check Tor connectivity ─────────────────────
     app.add_log(&format!("Checking Tor proxy at {}...", config.proxy));
@@ -97,7 +100,7 @@ async fn run_app(
                         } => {
                             let tx = app.progress_tx.clone();
                             let dl_id = app.start_download(&url, network.clone(), chunks);
-                            app.add_log(&format!("🔗 Connecting to {}...", &url));
+                            app.add_log(&format!("🔗 Connecting to {}...", url));
 
                             let client_res = match network {
                                 NetworkMode::Tor => tor::build_client(&app.proxy_addr),

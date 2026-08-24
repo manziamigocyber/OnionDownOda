@@ -23,7 +23,9 @@ serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 thiserror = "2"
 dirs = "6"
-tempfile = "3"
+percent-encoding = "2"
+unicode-width = "0.2"
+time = { version = "0.3", features = ["local-offset"] }
 
 [profile.release]
 strip = true

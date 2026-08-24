@@ -26,11 +26,13 @@ pub struct CliArgs {
 pub struct FileConfig {
     pub proxy: Option<String>,
     pub output_dir: Option<PathBuf>,
+    pub verbose: Option<bool>,
 }
 
 pub struct Config {
     pub proxy: String,
     pub output_dir: PathBuf,
+    pub verbose: bool,
 }
 
 impl Config {
@@ -52,6 +54,7 @@ impl Config {
                 .or(file_config.output_dir)
                 .or_else(dirs::download_dir)
                 .unwrap_or_else(|| PathBuf::from("~/Downloads")),
+            verbose: cli.verbose || file_config.verbose.unwrap_or(false),
         }
     }
 }
