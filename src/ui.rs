@@ -1,5 +1,8 @@
-use crate::app::{format_bytes, App, AppMode, DialogFocus, DownloadStatus, Focus, NetworkMode};
+use crate::app::{
+    format_bytes, App, AppMode, DialogFocus, DownloadStatus, Focus, NetworkMode, SettingsField,
+};
 use crate::banner::BANNER;
+use crate::history;
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -19,6 +22,11 @@ const GRAY: Color = Color::Rgb(180, 180, 180);
 const DIM_GRAY: Color = Color::Rgb(80, 80, 80);
 const DARK_BG: Color = Color::Rgb(0, 0, 0);
 const SURFACE: Color = Color::Rgb(10, 10, 10);
+
+/// Column offset pieces of the editable path text inside the save dialog.
+const DIALOG_PATH_LABEL: &str = "💾 Save to:  ";
+/// Column offset pieces of the editable path text inside the settings panel.
+const SETTINGS_DIR_LABEL: &str = "Folder:  ";
 
 fn lerp(a: f32, b: f32, t: f32) -> f32 {
     a + (b - a) * t
@@ -44,11 +52,12 @@ pub fn draw(frame: &mut Frame, app: &App) {
     let main_layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Percentage(28),
-            Constraint::Percentage(7),
-            Constraint::Percentage(10),
-            Constraint::Percentage(32),
-            Constraint::Percentage(12),
+            Constraint::Percentage(22),
+            Constraint::Percentage(6),
+            Constraint::Percentage(8),
+            Constraint::Percentage(27),
+            Constraint::Percentage(23),
+            Constraint::Percentage(14),
         ])
         .split(size);
 
@@ -61,13 +70,16 @@ pub fn draw(frame: &mut Frame, app: &App) {
     draw_tor_status(frame, app, main_layout[1]);
     draw_input(frame, app, main_layout[2]);
     draw_downloads(frame, app, main_layout[3]);
-    draw_log(frame, app, main_layout[4]);
+    draw_history(frame, app, main_layout[4]);
+    draw_log(frame, app, main_layout[5]);
     draw_disclaimer_and_help(frame, app, size);
 
     if app.mode == AppMode::Dialog {
         draw_dialog(frame, app, size);
     } else if app.mode == AppMode::Help {
         draw_help(frame, size);
+    } else if app.mode == AppMode::Settings {
+        draw_settings(frame, app, size);
     }
 }
 
@@ -203,7 +215,7 @@ fn draw_input(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 
     let display_text = if app.input.is_empty() && !focused {
         Line::from(Span::styled(
-            "  Enter a URL and press Enter to configure download...",
+            "  Enter a URL — mode is auto-detected, you just confirm the save folder",
             Style::default().fg(DIM_GRAY).add_modifier(Modifier::ITALIC),
         ))
     } else {
@@ -245,7 +257,7 @@ fn draw_downloads(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 
     if app.downloads.is_empty() {
         let empty = Paragraph::new(Line::from(Span::styled(
-            "  No downloads yet — paste a URL above and hit Enter",
+            "  No active downloads — paste a URL above and hit Enter",
             Style::default().fg(DIM_GRAY).add_modifier(Modifier::ITALIC),
         )))
         .block(block);
@@ -269,7 +281,6 @@ fn draw_downloads(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 
         let icon = match &dl.status {
             DownloadStatus::InProgress => "⏳",
-            DownloadStatus::Paused => "⏸️",
             DownloadStatus::Completed => "✅",
             DownloadStatus::Failed(_) => "❌",
         };
@@ -278,76 +289,49 @@ fn draw_downloads(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
             Span::styled(format!("{}{} ", prefix, icon), Style::default().fg(WHITE)),
             Span::styled(&dl.filename, base_style.fg(WHITE)),
             Span::styled(
-                format!(
-                    "  [{} | {} chunks]",
-                    if dl.network == NetworkMode::Tor {
-                        "TOR"
-                    } else {
-                        "NORMAL"
-                    },
-                    dl.chunks
-                ),
+                format!("  [{} | {} conn]", dl.network.label(), dl.chunks),
                 Style::default().fg(DIM_GRAY).add_modifier(Modifier::ITALIC),
             ),
         ]));
 
         match &dl.status {
-            DownloadStatus::InProgress | DownloadStatus::Paused => {
-                let is_paused = dl.status == DownloadStatus::Paused;
-                let speed = if is_paused { 0.0 } else { dl.speed_bps };
-                let speed_str = format!("{}/s", format_bytes(speed as u64));
+            DownloadStatus::InProgress => {
+                let speed_str = format!("{}/s", format_bytes(dl.speed_bps as u64));
 
                 if let Some(total) = dl.total_bytes {
                     let ratio = dl.downloaded_bytes as f64 / total as f64;
                     let bar_width = (inner.width as usize).saturating_sub(30).max(10);
                     let filled = (ratio * bar_width as f64) as usize;
                     let empty = bar_width.saturating_sub(filled);
-                    let eta_str = if is_paused {
-                        "PAUSED".to_string()
-                    } else {
-                        dl.eta_seconds()
-                            .map(|s| format!("ETA {}s", s))
-                            .unwrap_or_default()
-                    };
+                    let eta_str = dl
+                        .eta_seconds()
+                        .map(|s| format!("ETA {}s", s))
+                        .unwrap_or_default();
                     let pct = (ratio * 100.0) as u32;
-                    let bar_color = if is_paused { Color::Red } else { GREEN };
 
                     lines.push(Line::from(vec![
                         Span::styled("   ", Style::default()),
-                        Span::styled("█".repeat(filled), Style::default().fg(bar_color)),
+                        Span::styled("█".repeat(filled), Style::default().fg(GREEN)),
                         Span::styled("░".repeat(empty), Style::default().fg(DIM_GRAY)),
                         Span::styled(
                             format!(" {:>3}%  {}  {}", pct, speed_str, eta_str),
-                            Style::default().fg(if is_paused { Color::Red } else { CYAN }),
+                            Style::default().fg(CYAN),
                         ),
                     ]));
                 } else {
-                    if is_paused {
-                        lines.push(Line::from(vec![
-                            Span::styled(
-                                "   ⏸️ Paused ".to_string(),
-                                Style::default().fg(Color::Red),
-                            ),
-                            Span::styled(
-                                format!("{}  {}", format_bytes(dl.downloaded_bytes), speed_str),
-                                Style::default().fg(CYAN),
-                            ),
-                        ]));
-                    } else {
-                        let spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-                        let spin_idx =
-                            (dl.started_at.elapsed().as_millis() / 100) as usize % spinner.len();
-                        lines.push(Line::from(vec![
-                            Span::styled(
-                                format!("   {} Downloading ", spinner[spin_idx]),
-                                Style::default().fg(GREEN),
-                            ),
-                            Span::styled(
-                                format!("{}  {}", format_bytes(dl.downloaded_bytes), speed_str),
-                                Style::default().fg(CYAN),
-                            ),
-                        ]));
-                    }
+                    let spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+                    let spin_idx =
+                        (dl.started_at.elapsed().as_millis() / 100) as usize % spinner.len();
+                    lines.push(Line::from(vec![
+                        Span::styled(
+                            format!("   {} Downloading ", spinner[spin_idx]),
+                            Style::default().fg(GREEN),
+                        ),
+                        Span::styled(
+                            format!("{}  {}", format_bytes(dl.downloaded_bytes), speed_str),
+                            Style::default().fg(CYAN),
+                        ),
+                    ]));
                 }
             }
             DownloadStatus::Completed => {
@@ -374,6 +358,142 @@ fn draw_downloads(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     );
 }
 
+// ── History pane ─────────────────────────────────────────────────
+
+fn history_status_visual(status: &str) -> (&'static str, Color) {
+    match status {
+        history::ST_IN_PROGRESS => ("⏳", CYAN),
+        history::ST_COMPLETED => ("✅", GREEN),
+        history::ST_FAILED => ("❌", Color::Red),
+        _ => ("•", GRAY),
+    }
+}
+
+fn draw_history(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+    let focused = app.focus == Focus::History && app.mode != AppMode::Dialog;
+    let title_style = if focused {
+        Style::default().fg(CYAN).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(MAGENTA).add_modifier(Modifier::BOLD)
+    };
+
+    let unfinished = app
+        .history
+        .iter()
+        .filter(|e| e.status != history::ST_COMPLETED)
+        .count();
+
+    let block = Block::default()
+        .title(Span::styled(
+            format!(" 📜 History ({}) ", app.history.len()),
+            title_style,
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(if focused { CYAN } else { MAGENTA }))
+        .style(Style::default().bg(SURFACE));
+
+    // Reserve one bottom row for key hints.
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .split(block.inner(area));
+
+    frame.render_widget(block, area);
+
+    let hint = Paragraph::new(Line::from(Span::styled(
+        " ↑↓ select · D delete · Tab back",
+        Style::default().fg(DIM_GRAY),
+    )));
+    frame.render_widget(hint, rows[1]);
+
+    if app.history.is_empty() {
+        let empty = Paragraph::new(Line::from(Span::styled(
+            "  Nothing yet — finished and interrupted downloads appear here",
+            Style::default().fg(DIM_GRAY).add_modifier(Modifier::ITALIC),
+        )));
+        frame.render_widget(empty, rows[0]);
+        return;
+    }
+
+    let mut lines = Vec::new();
+
+    if unfinished > 0 {
+        lines.push(Line::from(Span::styled(
+            format!(" ⚠ {} unfinished download(s) on record", unfinished),
+            Style::default().fg(YELLOW).add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(""));
+    }
+
+    for (i, entry) in app.history.iter().enumerate() {
+        let is_selected = app.history_selected == i;
+        let prefix = if is_selected { "> " } else { "  " };
+        let (icon, color) = history_status_visual(&entry.status);
+
+        let size_part = match entry.total_bytes {
+            Some(total) if total > 0 => {
+                let pct = ((entry.downloaded_bytes as f64 / total as f64) * 100.0) as u32;
+                format!(
+                    "{}/{} ({}%)",
+                    format_bytes(entry.downloaded_bytes),
+                    format_bytes(total),
+                    pct.min(100)
+                )
+            }
+            _ => format_bytes(entry.downloaded_bytes),
+        };
+
+        let err_part = match (&entry.error, entry.status.as_str()) {
+            (Some(e), history::ST_FAILED) => format!(" · {}", truncate(e, 42)),
+            _ => String::new(),
+        };
+
+        let base_style = if is_selected {
+            Style::default().add_modifier(Modifier::BOLD).fg(WHITE)
+        } else {
+            Style::default().fg(WHITE)
+        };
+
+        lines.push(Line::from(vec![
+            Span::styled(format!("{}{} ", prefix, icon), Style::default().fg(color)),
+            Span::styled(entry.filename.clone(), base_style),
+            Span::styled(format!("  {}", size_part), Style::default().fg(CYAN)),
+            Span::styled(
+                format!("  [{}]", entry.network.to_uppercase()),
+                Style::default().fg(DIM_GRAY),
+            ),
+            Span::styled(
+                format!(" {} · {}", entry.status_label(), entry.updated_at),
+                Style::default().fg(color),
+            ),
+            Span::styled(err_part, Style::default().fg(Color::Red)),
+        ]));
+
+        lines.push(Line::from(Span::styled(
+            format!("     {}", truncate(&entry.url, 96)),
+            Style::default().fg(DIM_GRAY).add_modifier(Modifier::ITALIC),
+        )));
+    }
+
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .scroll((app.history_scroll, 0)),
+        rows[0],
+    );
+}
+
+fn truncate(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        s.to_string()
+    } else {
+        let cut: String = s.chars().take(max_chars.saturating_sub(1)).collect();
+        format!("{}…", cut)
+    }
+}
+
+// ── Log ──────────────────────────────────────────────────────────
+
 fn draw_log(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let block = Block::default()
         .title(Span::styled(
@@ -384,7 +504,7 @@ fn draw_log(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         .border_style(Style::default().fg(Color::Rgb(40, 40, 40)))
         .style(Style::default().bg(Color::Rgb(10, 10, 10)));
 
-    let max_visible = 4;
+    let max_visible = 5;
     let total_logs = app.log_messages.len();
     let scroll = app.log_scroll as usize;
 
@@ -397,11 +517,17 @@ fn draw_log(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         .skip(start)
         .take(end - start)
         .map(|msg| {
-            let color = if msg.contains('✅') || msg.contains("Connected") {
+            let color = if msg.contains('✅') || msg.contains("Connected") || msg.contains("⚙") {
                 GREEN
-            } else if msg.contains('❌') || msg.contains('⚠') {
+            } else if msg.contains('❌') || msg.contains('⚠') || msg.contains('🗑') {
                 Color::Red
-            } else if msg.contains("📥") || msg.contains("🔗") {
+            } else if msg.contains("📥")
+                || msg.contains("🔗")
+                || msg.contains('🔁')
+                || msg.contains("💾")
+                || msg.contains("⚡")
+                || msg.contains("📌")
+            {
                 CYAN
             } else {
                 GRAY
@@ -415,6 +541,8 @@ fn draw_log(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 
     frame.render_widget(Paragraph::new(log_lines).block(block), area);
 }
+
+// ── Disclaimer + footer ──────────────────────────────────────────
 
 fn draw_disclaimer_and_help(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let bottom = Layout::default()
@@ -446,49 +574,31 @@ fn draw_disclaimer_and_help(frame: &mut Frame, app: &App, area: ratatui::layout:
         let focus_label = match app.focus {
             Focus::Input => "INPUT",
             Focus::Downloads => "DOWNLOADS",
-            Focus::Help => "HELP",
+            Focus::History => "HISTORY",
         };
 
-        let help_badge_style = if app.focus == Focus::Help {
-            Style::default()
-                .fg(DARK_BG)
-                .bg(CYAN)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(CYAN).add_modifier(Modifier::BOLD)
+        let k = |s: &'static str| {
+            Span::styled(s, Style::default().fg(GREEN).add_modifier(Modifier::BOLD))
         };
 
         let help = Line::from(vec![
-            Span::styled(
-                "[Enter]",
-                Style::default().fg(GREEN).add_modifier(Modifier::BOLD),
-            ),
+            k("[Enter]"),
             Span::styled(" Download  ", Style::default().fg(WHITE)),
-            Span::styled(
-                "[Space]",
-                Style::default().fg(GREEN).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(" Pause  ", Style::default().fg(WHITE)),
-            Span::styled(
-                "[Tab]",
-                Style::default().fg(GREEN).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(" Focus  ", Style::default().fg(WHITE)),
-            Span::styled(
-                "[↑↓]",
-                Style::default().fg(GREEN).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(" Scroll/Select  ", Style::default().fg(WHITE)),
-            Span::styled(" [HELP] ", help_badge_style),
-            Span::styled(
-                "  [Esc]",
-                Style::default().fg(LOGO_PINK).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(" Quit  ", Style::default().fg(WHITE)),
+            k("[Tab]"),
+            Span::styled(" Panes  ", Style::default().fg(WHITE)),
+            k("[S]"),
+            Span::styled(" Settings  ", Style::default().fg(WHITE)),
+            k("[H]"),
+            Span::styled(" Help  ", Style::default().fg(WHITE)),
             Span::styled(
                 format!("▸ {}", focus_label),
                 Style::default().fg(MAGENTA).add_modifier(Modifier::BOLD),
             ),
+            Span::styled(
+                "  [Esc]",
+                Style::default().fg(LOGO_PINK).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" Quit", Style::default().fg(WHITE)),
         ]);
 
         frame.render_widget(
@@ -498,30 +608,36 @@ fn draw_disclaimer_and_help(frame: &mut Frame, app: &App, area: ratatui::layout:
     }
 }
 
-fn draw_dialog(frame: &mut Frame, app: &App, area: Rect) {
-    let popup_layout = Layout::default()
+// ── Save-location dialog ─────────────────────────────────────────
+
+fn popup_area(area: Rect, pct_h: u16, height: u16, pct_w: u16) -> Rect {
+    let vertical = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Percentage(30),
-            Constraint::Length(12),
-            Constraint::Percentage(30),
+            Constraint::Percentage(pct_h),
+            Constraint::Length(height),
+            Constraint::Min(0),
         ])
         .split(area);
 
-    let popup_area = Layout::default()
+    Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Percentage(20),
-            Constraint::Percentage(60),
-            Constraint::Percentage(20),
+            Constraint::Percentage(pct_w),
+            Constraint::Percentage(100 - pct_w * 2),
+            Constraint::Percentage(pct_w),
         ])
-        .split(popup_layout[1])[1];
+        .split(vertical[1])[1]
+}
+
+fn draw_dialog(frame: &mut Frame, app: &App, area: Rect) {
+    let popup_area = popup_area(area, 28, 13, 20);
 
     frame.render_widget(Clear, popup_area);
 
     let block = Block::default()
         .title(Span::styled(
-            " Configure Download ",
+            " 📁 Choose Save Location ",
             Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
         ))
         .borders(Borders::ALL)
@@ -531,120 +647,118 @@ fn draw_dialog(frame: &mut Frame, app: &App, area: Rect) {
     let inner = block.inner(popup_area);
     frame.render_widget(block, popup_area);
 
+    let mode_sel = match app.dialog_network {
+        NetworkMode::Tor => "[ TOR ]",
+        NetworkMode::Normal => "[ NORMAL ]",
+    };
+    let mode_note = if app.dialog_mode_auto {
+        "auto-detected"
+    } else {
+        "forced in Settings"
+    };
+
+    let url_display = truncate(&app.dialog_url, (inner.width as usize).saturating_sub(6));
+
     let mut lines = Vec::new();
     lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("  🔗 ", Style::default().fg(MAGENTA)),
+        Span::styled(url_display, Style::default().fg(GRAY)),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("  🌐 Mode:  ", Style::default().fg(MAGENTA)),
+        Span::styled(
+            format!("{} ", mode_sel),
+            Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("({})", mode_note),
+            Style::default().fg(DIM_GRAY).add_modifier(Modifier::ITALIC),
+        ),
+    ]));
+    lines.push(Line::from(""));
 
-    let net_style = if app.dialog_focus == DialogFocus::Network {
+    let path_style = if app.dialog_focus == DialogFocus::Path {
         Style::default().fg(CYAN).add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(GRAY)
     };
-    let net_sel = match app.dialog_network {
-        NetworkMode::Tor => "[ TOR ]  Normal ",
-        NetworkMode::Normal => "  Tor   [ NORMAL ]",
+    let path_marker = if app.dialog_focus == DialogFocus::Path {
+        "> "
+    } else {
+        "  "
     };
+    let path_prefix = format!("{}{}", path_marker, DIALOG_PATH_LABEL);
     lines.push(Line::from(vec![
-        Span::styled(
-            if app.dialog_focus == DialogFocus::Network {
-                "  > Network:  "
-            } else {
-                "    Network:  "
-            },
-            net_style,
-        ),
-        Span::styled(net_sel, net_style),
-    ]));
-    lines.push(Line::from(""));
-
-    let chk_style = if app.dialog_focus == DialogFocus::Chunks {
-        Style::default().fg(CYAN).add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(GRAY)
-    };
-    let c16 = if app.dialog_chunks == 16 {
-        "[16]"
-    } else {
-        " 16 "
-    };
-    let c32 = if app.dialog_chunks == 32 {
-        "[32]"
-    } else {
-        " 32 "
-    };
-    let c64 = if app.dialog_chunks == 64 {
-        "[64]"
-    } else {
-        " 64 "
-    };
-    let c100 = if app.dialog_chunks == 100 {
-        "[100]"
-    } else {
-        " 100 "
-    };
-
-    lines.push(Line::from(vec![
-        Span::styled(
-            if app.dialog_focus == DialogFocus::Chunks {
-                "  > Chunks:   "
-            } else {
-                "    Chunks:   "
-            },
-            chk_style,
-        ),
-        Span::styled(format!("{} {} {} {}", c16, c32, c64, c100), chk_style),
+        Span::styled(path_prefix.clone(), path_style),
+        Span::styled(app.dialog_path.clone(), path_style),
     ]));
     lines.push(Line::from(""));
     lines.push(Line::from(""));
 
-    let start_style = if app.dialog_focus == DialogFocus::Start {
-        Style::default()
-            .fg(DARK_BG)
-            .bg(GREEN)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(GREEN)
-    };
-    let cancel_style = if app.dialog_focus == DialogFocus::Cancel {
-        Style::default()
-            .fg(DARK_BG)
-            .bg(LOGO_PINK)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(LOGO_PINK)
+    let btn = |focused: bool, label: &str, color: Color| {
+        if focused {
+            Span::styled(
+                label.to_string(),
+                Style::default()
+                    .fg(DARK_BG)
+                    .bg(color)
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else {
+            Span::styled(label.to_string(), Style::default().fg(color))
+        }
     };
 
-    let buttons = Line::from(vec![
-        Span::styled("   [ START ]  ", start_style),
-        Span::from("      "),
-        Span::styled("   [ CANCEL ]   ", cancel_style),
-    ]);
-
-    lines.push(buttons);
-    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::from("   "),
+        btn(app.dialog_focus == DialogFocus::Start, "[ START ]", GREEN),
+        Span::from("   "),
+        btn(
+            app.dialog_focus == DialogFocus::Always,
+            "[ ALWAYS HERE ]",
+            YELLOW,
+        ),
+        Span::from("   "),
+        btn(
+            app.dialog_focus == DialogFocus::Cancel,
+            "[ CANCEL ]",
+            LOGO_PINK,
+        ),
+    ]));
     lines.push(Line::from(Span::styled(
-        "   (Use Arrows/Tab to navigate, Enter to select)",
+        "   Type to edit path · Arrows navigate · Enter selects",
         Style::default().fg(DIM_GRAY),
     )));
 
-    frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), inner);
+    frame.render_widget(Paragraph::new(lines), inner);
+
+    if app.dialog_focus == DialogFocus::Path {
+        let cursor = app.dialog_cursor.min(app.dialog_path.len());
+        let prefix_width = unicode_width::UnicodeWidthStr::width(path_prefix.as_str()) as u16;
+        let typed_width = unicode_width::UnicodeWidthStr::width(&app.dialog_path[..cursor]) as u16;
+        frame.set_cursor_position((inner.x + prefix_width + typed_width, inner.y + 4));
+    }
 }
+
+// ── Help ─────────────────────────────────────────────────────────
 
 fn draw_help(frame: &mut Frame, area: Rect) {
     let popup_layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Percentage(15),
-            Constraint::Length(20),
-            Constraint::Percentage(15),
+            Constraint::Percentage(8),
+            Constraint::Percentage(84),
+            Constraint::Percentage(8),
         ])
         .split(area);
 
     let popup_area = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Percentage(15),
-            Constraint::Percentage(70),
-            Constraint::Percentage(15),
+            Constraint::Percentage(14),
+            Constraint::Percentage(72),
+            Constraint::Percentage(14),
         ])
         .split(popup_layout[1])[1];
 
@@ -662,25 +776,61 @@ fn draw_help(frame: &mut Frame, area: Rect) {
     let inner = block.inner(popup_area);
     frame.render_widget(block, popup_area);
 
-    let mut lines = Vec::new();
+    let mut lines = vec![Line::from("")];
+
+    // ── Connection modes explainer ──
+    lines.push(Line::from(Span::styled(
+        "  🌐 Connection Modes",
+        Style::default()
+            .fg(LOGO_MAGENTA)
+            .add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(Span::styled(
+        "  NORMAL MODE — Downloads directly over the regular internet using standard",
+        Style::default().fg(WHITE),
+    )));
+    lines.push(Line::from(Span::styled(
+        "  HTTP/HTTPS protocols. Fast and suitable for most files.",
+        Style::default().fg(WHITE),
+    )));
+    lines.push(Line::from(Span::styled(
+        "  TOR MODE — Routes the download through the Tor anonymity network via",
+        Style::default().fg(WHITE),
+    )));
+    lines.push(Line::from(Span::styled(
+        "  .onion URLs. Slower, but private and reaches hidden services. Requires",
+        Style::default().fg(WHITE),
+    )));
+    lines.push(Line::from(Span::styled(
+        "  Tor running locally (socks5://127.0.0.1:9050 by default).",
+        Style::default().fg(WHITE),
+    )));
+    lines.push(Line::from(Span::styled(
+        "  🔗 SMART LINKS — Paste any link: .onion → Tor automatically, regular",
+        Style::default().fg(GREEN),
+    )));
+    lines.push(Line::from(Span::styled(
+        "  http(s) links → Normal automatically. No questions asked.",
+        Style::default().fg(GREEN),
+    )));
     lines.push(Line::from(""));
 
     let instructions = vec![
         (
             "📎 Start Download:",
-            "Paste standard or .onion URL inside the top Input box and hit Enter.",
+            "Paste a URL, hit Enter, confirm the save folder. That's it — defaults handle the rest.",
         ),
         (
-            "⚙️ Configurations:",
-            "In the pop-up, you can select whether to force Tor routing or normal.",
+            "📁 Always Here:",
+            "In the save dialog, pick ALWAYS HERE once to skip the folder prompt forever.",
         ),
         (
-            "🚀 Chunks:",
-            "Select the concurrent thread limits (Parallel downloads). Use Left/Right keys.",
+            "📜 History:",
+            "Every download is logged with its size, status and date. Press D to remove an entry.",
         ),
         (
-            "⏸️ Pause/Resume:",
-            "Press Tab to switch to the Downloads pane, use Arrows to select, hit Space.",
+            "⚙️ Settings:",
+            "Press S or Ctrl+S from anywhere — default folder, connection mode, threads.",
         ),
         (
             "❌ Failures/403:",
@@ -699,9 +849,8 @@ fn draw_help(frame: &mut Frame, area: Rect) {
                 cmd.to_string(),
                 Style::default().fg(GREEN).add_modifier(Modifier::BOLD),
             ),
-            Span::styled(format!(" - {}", desc), Style::default().fg(WHITE)),
+            Span::styled(format!(" {}", desc), Style::default().fg(WHITE)),
         ]));
-        lines.push(Line::from(""));
     }
 
     lines.push(Line::from(""));
@@ -716,4 +865,121 @@ fn draw_help(frame: &mut Frame, area: Rect) {
             .wrap(Wrap { trim: false }),
         inner,
     );
+}
+
+// ── Settings panel ───────────────────────────────────────────────
+
+fn draw_settings(frame: &mut Frame, app: &App, area: Rect) {
+    let popup_area = popup_area(area, 25, 12, 18);
+
+    frame.render_widget(Clear, popup_area);
+
+    let block = Block::default()
+        .title(Span::styled(
+            " ⚙️ Settings ",
+            Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(CYAN))
+        .style(Style::default().bg(DARK_BG));
+
+    let inner = block.inner(popup_area);
+    frame.render_widget(block, popup_area);
+
+    let field_style = |f: SettingsField| {
+        if app.settings_field == f {
+            Style::default().fg(CYAN).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(GRAY)
+        }
+    };
+    let marker = |f: SettingsField| {
+        if app.settings_field == f {
+            "> "
+        } else {
+            "  "
+        }
+    };
+
+    let threads_display = if app.settings_field == SettingsField::Threads {
+        format!("‹ {} ›", app.settings.parallel_threads)
+    } else {
+        format!("  {}  ", app.settings.parallel_threads)
+    };
+    let ask_display = if app.settings.ask_directory {
+        "ON"
+    } else {
+        "OFF"
+    };
+
+    let dir_row_is_focused = app.settings_field == SettingsField::Directory;
+    let dir_marker = if dir_row_is_focused { "> " } else { "  " };
+    let dir_prefix = format!("{}{}", dir_marker, SETTINGS_DIR_LABEL);
+
+    let done_style = if app.settings_field == SettingsField::Done {
+        Style::default()
+            .fg(DARK_BG)
+            .bg(GREEN)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(GREEN)
+    };
+
+    let lines = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(dir_prefix, field_style(SettingsField::Directory)),
+            Span::styled(
+                app.settings_dir_buf.clone(),
+                field_style(SettingsField::Directory),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                format!("{}Connection Mode:  ", marker(SettingsField::Mode)),
+                field_style(SettingsField::Mode),
+            ),
+            Span::styled(
+                format!("‹ {} ›", app.settings.default_mode.label()),
+                field_style(SettingsField::Mode),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                format!("{}Parallel Threads:  ", marker(SettingsField::Threads)),
+                field_style(SettingsField::Threads),
+            ),
+            Span::styled(threads_display, field_style(SettingsField::Threads)),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                format!(
+                    "{}Ask Folder Each Time:  ",
+                    marker(SettingsField::AskEveryTime)
+                ),
+                field_style(SettingsField::AskEveryTime),
+            ),
+            Span::styled(ask_display, field_style(SettingsField::AskEveryTime)),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::from("   "),
+            Span::styled("  [ DONE ]  ", done_style),
+            Span::styled(
+                "(Esc saves & closes · changes apply instantly)",
+                Style::default().fg(DIM_GRAY),
+            ),
+        ]),
+    ];
+
+    frame.render_widget(Paragraph::new(lines), inner);
+
+    if dir_row_is_focused {
+        let cursor = app.settings_cursor.min(app.settings_dir_buf.len());
+        let prefix_width = unicode_width::UnicodeWidthStr::width(dir_marker) as u16
+            + unicode_width::UnicodeWidthStr::width(SETTINGS_DIR_LABEL) as u16;
+        let typed_width =
+            unicode_width::UnicodeWidthStr::width(&app.settings_dir_buf[..cursor]) as u16;
+        frame.set_cursor_position((inner.x + prefix_width + typed_width, inner.y + 1));
+    }
 }
