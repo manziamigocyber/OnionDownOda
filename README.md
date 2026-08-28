@@ -37,22 +37,35 @@
 
 ---
 
-## 🚀 What's New in v2.0.0
+## 🚀 What's New in v3.0.0
 
-### 🔬 Technical Audit & Quality Results
+Version 3 adds the download-management features that make OnionDownOda feel more like a full desktop download manager while keeping its fast, keyboard-first TUI.
+
+### 🎛 Download Management
+
+- **Smart Categories** — Automatically labels downloads as Video, Music, Documents, Programs, Archives, or Other.
+- **Quick Search** — Press `/` in Downloads or History to filter by filename, URL, or category.
+- **Batch Controls** — Pause all with `P`, resume paused items with `U`, and retry failed items with `Y`.
+- **Persistent State** — Categories and unfinished download records survive application restarts.
+- **Polished Status UI** — Live active, queued, completed counters, colored category badges, and a focused search overlay.
+
+### 🔬 Reliability Improvements
+
+#### 🔬 Technical Audit & Quality Results
 
 | Category | Status | Details |
 |----------|--------|---------|
 | Compiler Warnings | ✅ 0 Warnings | All unused imports and dead code pragmas resolved |
 | Clippy Linting | ✅ Pass | Fixed redundant closures, matches macro, and import paths |
 | Code Style | ✅ Idiomatic | Fully formatted to standard Rust styles using `cargo fmt` |
-| Build Stability | ✅ v2.0.0 | Verified via `cargo publish --dry-run` |
+| Build Stability | ✅ v3.0.0 | Verified by the maintainer with the GNU Windows release build |
 
 ### 🐛 Known Limitations Resolved
 
 - **403 Forbidden Errors** — Now explicitly handled and logged when servers (like Cloudflare) block automated requests.
 - **File Clashes** — Downloads with the same name now automatically increment (e.g., `file (1).zip`).
 - **Global Pausing** — Fixed the bug where pausing one download would break the entire HTTP pipeline for others.
+- **Pause/Resume Recovery** — Parallel scratch files and single-stream partial files are preserved and reused across pauses, retries, and restarts.
 
 ---
 
