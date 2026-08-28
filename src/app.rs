@@ -160,14 +160,81 @@ pub enum Focus {
 #[derive(Debug, Clone, PartialEq)]
 pub enum DownloadStatus {
     InProgress,
+    Paused,
+    Queued,
     Completed,
     Failed(String),
+}
+
+/// A lightweight automatic category for the download manager UI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DownloadCategory {
+    Video,
+    Music,
+    Documents,
+    Programs,
+    Archives,
+    Other,
+}
+
+impl DownloadCategory {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Video => "Video",
+            Self::Music => "Music",
+            Self::Documents => "Documents",
+            Self::Programs => "Programs",
+            Self::Archives => "Archives",
+            Self::Other => "Other",
+        }
+    }
+
+    pub fn parse(value: &str) -> Self {
+        match value.to_ascii_lowercase().as_str() {
+            "video" | "videos" => Self::Video,
+            "music" | "audio" => Self::Music,
+            "document" | "documents" => Self::Documents,
+            "program" | "programs" => Self::Programs,
+            "archive" | "archives" => Self::Archives,
+            _ => Self::Other,
+        }
+    }
+
+    pub fn from_filename(filename: &str) -> Self {
+        let extension = std::path::Path::new(filename)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        match extension.as_str() {
+            "mp4" | "mkv" | "webm" | "avi" | "mov" | "m4v" | "mpeg" | "mpg" => Self::Video,
+            "mp3" | "flac" | "wav" | "ogg" | "m4a" | "aac" | "opus" | "wma" => Self::Music,
+            "pdf" | "doc" | "docx" | "txt" | "md" | "rtf" | "csv" | "xls" | "xlsx" | "ppt"
+            | "pptx" | "epub" => Self::Documents,
+            "exe" | "msi" | "dmg" | "deb" | "rpm" | "apk" | "appimage" => Self::Programs,
+            "zip" | "rar" | "7z" | "tar" | "gz" | "bz2" | "xz" | "iso" | "zst" => Self::Archives,
+            _ => Self::Other,
+        }
+    }
+}
+
+/// Snapshot needed to resume a paused download.
+#[derive(Debug, Clone)]
+pub struct ResumeInfo {
+    pub url: String,
+    pub network: NetworkMode,
+    pub chunks: usize,
+    pub total_size: Option<u64>,
+    pub output_dir: PathBuf,
+    pub partial_path: Option<PathBuf>,
+    pub temp_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
 pub struct Download {
     pub id: usize,
     pub filename: String,
+    pub category: DownloadCategory,
     pub network: NetworkMode,
     pub chunks: usize,
     pub total_bytes: Option<u64>,
@@ -178,6 +245,13 @@ pub struct Download {
     pub speed_bps: f64,
     /// Link to the persistent history entry (its `id`), if any.
     pub history_id: Option<String>,
+    /// URL used to start this download — needed to resume it.
+    pub url: String,
+    /// Resume snapshot, filled in when the download is paused.
+    pub resume_info: Option<ResumeInfo>,
+    /// On-disk path currently being written. Captured from the engine's
+    /// `Started` event so a paused download can be resumed by appending to it.
+    pub partial_path: Option<PathBuf>,
 }
 
 impl Download {
@@ -201,6 +275,24 @@ pub enum Action {
         chunks: usize,
         output_dir: PathBuf,
     },
+    /// Pause the selected download (triggers shutdown of its task).
+    PauseDownload {
+        id: usize,
+    },
+    /// Resume a paused download (spawns a new task with the saved resume info).
+    ResumeDownload {
+        id: usize,
+    },
+    /// Retry a failed download, reusing any partial data that remains.
+    RetryDownload {
+        id: usize,
+    },
+    /// Pause every currently running transfer.
+    PauseAll,
+    /// Resume every paused transfer.
+    ResumeAll,
+    /// Retry every failed transfer.
+    RetryAll,
     Quit,
 }
 
@@ -255,6 +347,10 @@ pub struct App {
     /// Skip disk writes for settings (used by tests to stay hermetic).
     pub dry_run_io: bool,
     pub unfinished_on_boot: usize,
+    /// Quick filter shared by the Downloads and History panes.
+    pub search_query: String,
+    pub search_cursor: usize,
+    pub search_mode: bool,
 }
 
 impl App {
@@ -299,6 +395,9 @@ impl App {
             history_file: None,
             dry_run_io: false,
             unfinished_on_boot: 0,
+            search_query: String::new(),
+            search_cursor: 0,
+            search_mode: false,
         }
     }
 
@@ -360,9 +459,21 @@ impl App {
             return self.handle_dialog_key(key);
         }
 
+        if self.search_mode {
+            return self.handle_search_key(key);
+        }
+
         // Global shortcuts (never fire while typing in the URL box).
         if self.focus != Focus::Input {
             match key.code {
+                KeyCode::Char('/') => {
+                    self.search_mode = true;
+                    self.search_cursor = self.search_query.len();
+                    return Action::None;
+                }
+                KeyCode::Char('p') | KeyCode::Char('P') => return Action::PauseAll,
+                KeyCode::Char('u') | KeyCode::Char('U') => return Action::ResumeAll,
+                KeyCode::Char('y') | KeyCode::Char('Y') => return Action::RetryAll,
                 KeyCode::Char('h') => {
                     self.mode = AppMode::Help;
                     return Action::None;
@@ -382,10 +493,150 @@ impl App {
         }
     }
 
+    fn handle_search_key(&mut self, key: KeyEvent) -> Action {
+        match key.code {
+            KeyCode::Esc => {
+                self.search_query.clear();
+                self.search_cursor = 0;
+                self.search_mode = false;
+            }
+            KeyCode::Enter => self.search_mode = false,
+            KeyCode::Backspace => {
+                if self.search_cursor > 0 {
+                    let new_pos = move_left(&self.search_query, self.search_cursor);
+                    self.search_query.replace_range(
+                        new_pos..self.search_cursor.min(self.search_query.len()),
+                        "",
+                    );
+                    self.search_cursor = new_pos;
+                }
+            }
+            KeyCode::Left => self.search_cursor = move_left(&self.search_query, self.search_cursor),
+            KeyCode::Right => {
+                self.search_cursor = move_right(&self.search_query, self.search_cursor)
+            }
+            KeyCode::Home => self.search_cursor = 0,
+            KeyCode::End => self.search_cursor = self.search_query.len(),
+            KeyCode::Char(c) => {
+                let pos = self.search_cursor.min(self.search_query.len());
+                let pos = if self.search_query.is_char_boundary(pos) {
+                    pos
+                } else {
+                    move_left(&self.search_query, pos)
+                };
+                self.search_query.insert(pos, c);
+                self.search_cursor = pos + c.len_utf8();
+            }
+            _ => {}
+        }
+        if !self.search_query.trim().is_empty() {
+            match self.focus {
+                Focus::Downloads if !self.download_matches_search(self.selected_download) => {
+                    if let Some(id) = self
+                        .downloads
+                        .iter()
+                        .enumerate()
+                        .find_map(|(id, _)| self.download_matches_search(id).then_some(id))
+                    {
+                        self.selected_download = id;
+                    }
+                }
+                Focus::History if !self.history_matches_search(self.history_selected) => {
+                    if let Some(id) = self
+                        .history
+                        .iter()
+                        .enumerate()
+                        .find_map(|(id, _)| self.history_matches_search(id).then_some(id))
+                    {
+                        self.history_selected = id;
+                    }
+                }
+                _ => {}
+            }
+        }
+        Action::None
+    }
+
+    pub fn download_matches_search(&self, id: usize) -> bool {
+        let Some(dl) = self.downloads.get(id) else {
+            return false;
+        };
+        self.matches_search([dl.filename.as_str(), dl.url.as_str(), dl.category.label()])
+    }
+
+    pub fn history_matches_search(&self, id: usize) -> bool {
+        let Some(entry) = self.history.get(id) else {
+            return false;
+        };
+        self.matches_search([
+            entry.filename.as_str(),
+            entry.url.as_str(),
+            entry.category.as_str(),
+        ])
+    }
+
+    fn matches_search<'a, I>(&self, fields: I) -> bool
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
+        let query = self.search_query.trim().to_ascii_lowercase();
+        query.is_empty()
+            || fields
+                .into_iter()
+                .any(|field| field.to_ascii_lowercase().contains(&query))
+    }
+
+    fn move_download_selection(&mut self, down: bool) {
+        if self.downloads.is_empty() {
+            return;
+        }
+        let mut idx = self.selected_download;
+        loop {
+            let next = if down {
+                (idx + 1).min(self.downloads.len().saturating_sub(1))
+            } else {
+                idx.saturating_sub(1)
+            };
+            if next == idx {
+                break;
+            }
+            idx = next;
+            if self.download_matches_search(idx) {
+                self.selected_download = idx;
+                break;
+            }
+        }
+    }
+
+    fn move_history_selection(&mut self, down: bool) {
+        if self.history.is_empty() {
+            return;
+        }
+        let mut idx = self.history_selected;
+        loop {
+            let next = if down {
+                (idx + 1).min(self.history.len().saturating_sub(1))
+            } else {
+                idx.saturating_sub(1)
+            };
+            if next == idx {
+                break;
+            }
+            idx = next;
+            if self.history_matches_search(idx) {
+                self.history_selected = idx;
+                break;
+            }
+        }
+    }
+
     fn active_downloads(&self) -> bool {
-        self.downloads
-            .iter()
-            .any(|d| d.status == DownloadStatus::InProgress)
+        self.downloads.iter().any(|d| {
+            matches!(
+                d.status,
+                DownloadStatus::InProgress | DownloadStatus::Paused | DownloadStatus::Queued
+            )
+        })
     }
 
     fn restore_mode(&mut self) {
@@ -644,15 +895,11 @@ impl App {
             }
             KeyCode::Char('q') | KeyCode::Esc => Action::Quit,
             KeyCode::Up => {
-                if self.selected_download > 0 {
-                    self.selected_download -= 1;
-                }
+                self.move_download_selection(false);
                 Action::None
             }
             KeyCode::Down => {
-                if !self.downloads.is_empty() && self.selected_download < self.downloads.len() - 1 {
-                    self.selected_download += 1;
-                }
+                self.move_download_selection(true);
                 Action::None
             }
             KeyCode::PageUp => {
@@ -662,6 +909,28 @@ impl App {
             KeyCode::PageDown => {
                 self.log_scroll = self.log_scroll.saturating_add(3);
                 Action::None
+            }
+            KeyCode::Char(' ') => {
+                let idx = self.selected_download;
+                if idx >= self.downloads.len() {
+                    return Action::None;
+                }
+                match self.downloads[idx].status {
+                    DownloadStatus::InProgress => Action::PauseDownload { id: idx },
+                    DownloadStatus::Paused => Action::ResumeDownload { id: idx },
+                    DownloadStatus::Failed(_) => Action::RetryDownload { id: idx },
+                    _ => Action::None,
+                }
+            }
+            KeyCode::Char('r') | KeyCode::Char('R') => {
+                let idx = self.selected_download;
+                if idx < self.downloads.len()
+                    && matches!(self.downloads[idx].status, DownloadStatus::Failed(_))
+                {
+                    Action::RetryDownload { id: idx }
+                } else {
+                    Action::None
+                }
             }
             _ => Action::None,
         }
@@ -677,15 +946,11 @@ impl App {
             }
             KeyCode::Char('q') | KeyCode::Esc => Action::Quit,
             KeyCode::Up => {
-                if self.history_selected > 0 {
-                    self.history_selected -= 1;
-                }
+                self.move_history_selection(false);
                 Action::None
             }
             KeyCode::Down => {
-                if !self.history.is_empty() && self.history_selected < self.history.len() - 1 {
-                    self.history_selected += 1;
-                }
+                self.move_history_selection(true);
                 Action::None
             }
             KeyCode::PageUp => {
@@ -700,8 +965,199 @@ impl App {
                 self.delete_history(self.history_selected);
                 Action::None
             }
+            KeyCode::Char('r') | KeyCode::Char('R') => {
+                let Some(entry) = self.history.get(self.history_selected) else {
+                    return Action::None;
+                };
+                if entry.status != history::ST_FAILED {
+                    return Action::None;
+                }
+                let history_id = entry.id.clone();
+                self.downloads
+                    .iter()
+                    .position(|dl| dl.history_id.as_deref() == Some(history_id.as_str()))
+                    .map(|id| Action::RetryDownload { id })
+                    .unwrap_or(Action::None)
+            }
             _ => Action::None,
         }
+    }
+
+    // ── Pause / Resume ───────────────────────────────────────────
+
+    /// Pause a download: save a resume snapshot and mark it Paused.
+    /// The caller (main loop) is responsible for setting the shutdown flag
+    /// and waiting for the task to exit cleanly.
+    pub fn pause_download(&mut self, id: usize) {
+        let Some(dl) = self.downloads.get(id) else {
+            return;
+        };
+        if dl.status != DownloadStatus::InProgress {
+            return;
+        }
+
+        let partial_path = dl.partial_path.clone();
+        // Find the history entry for this download so we can use the
+        // exact output directory (custom folder) it was saved to.
+        let output_dir = dl
+            .history_id
+            .as_ref()
+            .and_then(|hid| {
+                self.history
+                    .iter()
+                    .find(|e| Some(&e.id) == Some(hid))
+                    .map(|e| {
+                        e.dir
+                            .as_ref()
+                            .map(PathBuf::from)
+                            .unwrap_or_else(|| self.settings.output_dir.clone())
+                    })
+            })
+            .unwrap_or_else(|| self.settings.output_dir.clone());
+
+        let temp_dir = dl.history_id.as_ref().and_then(|hid| {
+            self.history
+                .iter()
+                .find(|e| &e.id == hid)
+                .and_then(|e| e.temp_dir.as_ref().map(PathBuf::from))
+                .or_else(|| Some(downloader::tmp_dir_for(&output_dir, hid)))
+        });
+
+        let resume_info = ResumeInfo {
+            url: dl.url.clone(),
+            network: dl.network.clone(),
+            chunks: dl.chunks,
+            total_size: dl.total_bytes,
+            output_dir,
+            partial_path: partial_path.clone(),
+            temp_dir,
+        };
+        if let Some(dl) = self.downloads.get_mut(id) {
+            dl.status = DownloadStatus::Paused;
+            dl.resume_info = Some(resume_info);
+        }
+        self.touch_history(id, Some(history::ST_PAUSED), None, partial_path);
+        self.add_log(&format!("⏸ Paused download #{}", id));
+    }
+
+    /// Flip a paused download back to InProgress so the main loop can spawn a
+    /// resume task that reuses the saved `resume_info`. Returns `None` if the
+    /// download cannot be resumed.
+    pub fn resume_download(&mut self, id: usize) -> Action {
+        let Some(dl) = self.downloads.get(id) else {
+            return Action::None;
+        };
+        if dl.status != DownloadStatus::Paused {
+            return Action::None;
+        }
+        if dl.resume_info.is_none() {
+            return Action::None;
+        }
+
+        let parallel_resume = self
+            .downloads
+            .get(id)
+            .and_then(|dl| dl.resume_info.as_ref())
+            .is_some_and(|info| info.partial_path.is_none());
+
+        if let Some(dl) = self.downloads.get_mut(id) {
+            dl.status = DownloadStatus::InProgress;
+            dl.started_at = Instant::now();
+            dl.last_update = Instant::now();
+            dl.speed_bps = 0.0;
+        }
+        self.touch_history(
+            id,
+            Some(history::ST_IN_PROGRESS),
+            None,
+            parallel_resume.then(PathBuf::new),
+        );
+        self.add_log(&format!("▶ Resuming download #{}", id));
+        Action::ResumeDownload { id }
+    }
+
+    /// Put a newly-added download into the waiting queue when the scheduler
+    /// has reached its active-download limit.
+    pub fn queue_download(&mut self, id: usize) {
+        if !self
+            .downloads
+            .get(id)
+            .is_some_and(|dl| dl.status == DownloadStatus::InProgress)
+        {
+            return;
+        }
+        if let Some(dl) = self.downloads.get_mut(id) {
+            dl.status = DownloadStatus::Queued;
+        }
+        self.touch_history(id, Some(history::ST_QUEUED), None, None);
+        self.add_log(&format!("⏳ Queued download #{}", id));
+    }
+
+    /// Activate a queued item. The caller decides whether to launch it as a
+    /// fresh transfer or through its saved resume snapshot.
+    pub fn activate_queued(&mut self, id: usize) -> bool {
+        if !self
+            .downloads
+            .get(id)
+            .is_some_and(|dl| dl.status == DownloadStatus::Queued)
+        {
+            return false;
+        }
+        if let Some(dl) = self.downloads.get_mut(id) {
+            dl.status = DownloadStatus::InProgress;
+            dl.started_at = Instant::now();
+            dl.last_update = Instant::now();
+            dl.speed_bps = 0.0;
+        }
+        self.touch_history(id, Some(history::ST_IN_PROGRESS), None, None);
+        true
+    }
+
+    /// Convert a failed transfer into a resumable queued transfer. Existing
+    /// chunk files or a single-stream partial are reused when available.
+    pub fn retry_download(&mut self, id: usize) -> bool {
+        let Some(dl) = self.downloads.get(id) else {
+            return false;
+        };
+        if !matches!(dl.status, DownloadStatus::Failed(_)) {
+            return false;
+        }
+
+        let output_dir = dl
+            .history_id
+            .as_ref()
+            .and_then(|hid| {
+                self.history
+                    .iter()
+                    .find(|e| &e.id == hid)
+                    .and_then(|e| e.dir.as_ref().map(PathBuf::from))
+            })
+            .unwrap_or_else(|| self.settings.output_dir.clone());
+        let temp_dir = dl.history_id.as_ref().and_then(|hid| {
+            self.history
+                .iter()
+                .find(|e| &e.id == hid)
+                .and_then(|e| e.temp_dir.as_ref().map(PathBuf::from))
+                .or_else(|| Some(downloader::tmp_dir_for(&output_dir, hid)))
+        });
+
+        let resume_info = ResumeInfo {
+            url: dl.url.clone(),
+            network: dl.network.clone(),
+            chunks: dl.chunks,
+            total_size: dl.total_bytes,
+            output_dir,
+            partial_path: dl.partial_path.clone(),
+            temp_dir,
+        };
+        if let Some(dl) = self.downloads.get_mut(id) {
+            dl.resume_info = Some(resume_info);
+            dl.status = DownloadStatus::Queued;
+            dl.speed_bps = 0.0;
+        }
+        self.touch_history(id, Some(history::ST_QUEUED), None, None);
+        self.add_log(&format!("🔁 Queued retry for download #{}", id));
+        true
     }
 
     fn delete_history(&mut self, idx: usize) {
@@ -717,6 +1173,9 @@ impl App {
         }
         for d in &dirs_to_clean {
             let _ = std::fs::remove_dir_all(downloader::tmp_dir_for(d, &entry.id));
+        }
+        if let Some(temp_dir) = entry.temp_dir.as_deref() {
+            let _ = std::fs::remove_dir_all(temp_dir);
         }
 
         if self.history_selected >= self.history.len() && self.history_selected > 0 {
@@ -745,11 +1204,20 @@ impl App {
             id: nid.clone(),
             url: url.to_string(),
             filename: filename.clone(),
+            category: DownloadCategory::from_filename(&filename)
+                .label()
+                .to_string(),
             filepath: None,
             dir: Some(output_dir.to_string_lossy().to_string()),
+            temp_dir: Some(
+                downloader::tmp_dir_for(&output_dir, &nid)
+                    .to_string_lossy()
+                    .to_string(),
+            ),
             network: network.as_str().to_string(),
             total_bytes: None,
             downloaded_bytes: 0,
+            chunks,
             status: history::ST_IN_PROGRESS.to_string(),
             error: None,
             added_at: stamp.clone(),
@@ -761,6 +1229,7 @@ impl App {
 
         self.downloads.push(Download {
             id,
+            category: DownloadCategory::from_filename(&filename),
             filename,
             network,
             chunks,
@@ -771,6 +1240,9 @@ impl App {
             last_update: Instant::now(),
             speed_bps: 0.0,
             history_id: Some(nid),
+            url: url.to_string(),
+            resume_info: None,
+            partial_path: None,
         });
         self.selected_download = id;
         self.focus = Focus::Downloads;
@@ -801,15 +1273,14 @@ impl App {
         } else {
             return;
         };
-
         let now = Instant::now();
-
         for progress in messages {
             match progress {
                 DownloadProgress::Started {
                     id,
                     filename,
                     total_bytes,
+                    filepath,
                 } => {
                     let size_str = total_bytes
                         .map(format_bytes)
@@ -819,8 +1290,21 @@ impl App {
                         let dl = &mut self.downloads[id];
                         dl.total_bytes = total_bytes;
                         dl.filename = filename.clone();
+                        // Parallel downloads emit an empty path (scratch files
+                        // hold the data); actively clear any stale partial.
+                        if filepath.as_os_str().is_empty() {
+                            dl.partial_path = None;
+                        } else {
+                            dl.partial_path = Some(filepath.clone());
+                        }
                     }
-                    self.touch_history(id, None, None, None);
+                    // For parallel downloads (empty filepath), clear any stale
+                    // single-stream filepath that may be persisted in history.
+                    if filepath.as_os_str().is_empty() {
+                        self.touch_history(id, None, None, Some(PathBuf::new()));
+                    } else {
+                        self.touch_history(id, None, None, None);
+                    }
                     self.add_log(&format!("📥 Starting: {} ({})", filename, size_str));
                 }
                 DownloadProgress::Progress {
@@ -869,12 +1353,22 @@ impl App {
                     self.check_mode_idle();
                 }
                 DownloadProgress::Failed { id, error } => {
+                    let is_paused = self
+                        .downloads
+                        .get(id)
+                        .is_some_and(|d| d.status == DownloadStatus::Paused);
                     if id < self.downloads.len() {
                         let dl = &mut self.downloads[id];
-                        dl.status = DownloadStatus::Failed(error.clone());
-                        dl.speed_bps = 0.0;
+                        // Don't overwrite a Paused state — the pause was intentional.
+                        if dl.status != DownloadStatus::Paused {
+                            dl.status = DownloadStatus::Failed(error.clone());
+                            dl.speed_bps = 0.0;
+                        }
                     }
-                    self.touch_history(id, Some(history::ST_FAILED), Some(error.clone()), None);
+                    // Only mark history as failed if not already paused.
+                    if !is_paused {
+                        self.touch_history(id, Some(history::ST_FAILED), Some(error.clone()), None);
+                    }
                     self.add_log(&format!("❌ Failed: {}", error));
                     self.check_mode_idle();
                 }
@@ -913,23 +1407,43 @@ impl App {
             None => return,
         };
         let filename = dl.filename.clone();
+        let category = dl.category.label().to_string();
         let downloaded = dl.downloaded_bytes;
         let total = dl.total_bytes;
 
         if let Some(e) = self.history.iter_mut().find(|e| e.id == hid) {
             e.filename = filename;
+            e.category = category;
             e.downloaded_bytes = downloaded;
             if total.is_some() {
                 e.total_bytes = total;
             }
-            if let Some(s) = status {
-                e.status = s.to_string();
-            }
+            // When pausing, explicitly write or clear filepath so stale
+            // single-stream paths don't survive for parallel downloads.
             if error.is_some() {
                 e.error = error;
             }
+            if let Some(s) = status {
+                e.status = s.to_string();
+                if s != history::ST_FAILED {
+                    e.error = None;
+                }
+                if s == history::ST_PAUSED {
+                    e.filepath = filepath.as_ref().map(|fp| fp.to_string_lossy().to_string());
+                } else if s == history::ST_COMPLETED {
+                    // A completed file no longer needs its scratch directory.
+                    e.temp_dir = None;
+                }
+            }
             if let Some(fp) = filepath {
-                e.filepath = Some(fp.to_string_lossy().to_string());
+                if status.is_none() || status != Some(history::ST_PAUSED) {
+                    // An empty PathBuf is the sentinel meaning "clear stale filepath".
+                    if fp.as_os_str().is_empty() {
+                        e.filepath = None;
+                    } else {
+                        e.filepath = Some(fp.to_string_lossy().to_string());
+                    }
+                }
             }
             e.updated_at = history::now_stamp();
             self.history_dirty = true;
@@ -938,8 +1452,9 @@ impl App {
 
     // ── Persistence ──────────────────────────────────────────────
 
-    /// Load the history log and normalise stale states: anything marked
-    /// running or paused when the app starts was interrupted by an exit.
+    /// Load the history log, normalise stale states, and rebuild live
+    /// `Download` entries for paused transfers so they can be resumed with
+    /// `Space` after a restart.
     pub fn load_history(&mut self) -> usize {
         let entries = match &self.history_file {
             Some(p) => history::load_from(p),
@@ -949,19 +1464,94 @@ impl App {
         let normalized: Vec<HistoryEntry> = entries
             .into_iter()
             .map(|mut e| {
-                if e.status != history::ST_COMPLETED {
-                    if e.status == history::ST_IN_PROGRESS || e.status == "paused" {
-                        e.status = history::ST_FAILED.to_string();
-                        if e.error.is_none() {
-                            e.error = Some("interrupted by exit".to_string());
-                        }
+                if e.status == history::ST_IN_PROGRESS {
+                    // A hard process exit can leave this state behind. Treat
+                    // it as paused so existing disk state remains recoverable.
+                    e.status = history::ST_PAUSED.to_string();
+                    if e.error.is_none() {
+                        e.error = Some("interrupted by exit".to_string());
                     }
+                }
+                if e.status != history::ST_COMPLETED
+                    && e.status != history::ST_PAUSED
+                    && e.status != history::ST_QUEUED
+                {
                     unfinished += 1;
                 }
                 e
             })
             .collect();
         self.unfinished_on_boot = unfinished;
+
+        // Rebuild live Download entries for paused and queued transfers. The
+        // partial file path and network mode live in the history entry; without
+        // this the Downloads pane is empty after a restart.
+        self.downloads.clear();
+        for e in normalized.iter() {
+            if e.status != history::ST_PAUSED
+                && e.status != history::ST_QUEUED
+                && e.status != history::ST_FAILED
+            {
+                continue;
+            }
+            let id = self.downloads.len();
+            let network = match e.network.as_str() {
+                "normal" => NetworkMode::Normal,
+                _ => NetworkMode::Tor,
+            };
+            let output_dir = e
+                .dir
+                .as_ref()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| self.settings.output_dir.clone());
+            let partial_path = e
+                .filepath
+                .as_deref()
+                .filter(|path| !path.is_empty())
+                .map(PathBuf::from);
+            let chunks = if e.chunks > 0 { e.chunks } else { 1 };
+            let temp_dir = e
+                .temp_dir
+                .as_ref()
+                .map(PathBuf::from)
+                .or_else(|| Some(downloader::tmp_dir_for(&output_dir, &e.id)));
+            let status = match e.status.as_str() {
+                history::ST_QUEUED => DownloadStatus::Queued,
+                history::ST_FAILED => DownloadStatus::Failed(
+                    e.error
+                        .clone()
+                        .unwrap_or_else(|| "download failed".to_string()),
+                ),
+                _ => DownloadStatus::Paused,
+            };
+
+            self.downloads.push(Download {
+                id,
+                filename: e.filename.clone(),
+                category: DownloadCategory::parse(&e.category),
+                network: network.clone(),
+                chunks,
+                total_bytes: e.total_bytes,
+                downloaded_bytes: e.downloaded_bytes,
+                status,
+                started_at: Instant::now(),
+                last_update: Instant::now(),
+                speed_bps: 0.0,
+                history_id: Some(e.id.clone()),
+                url: e.url.clone(),
+                resume_info: Some(ResumeInfo {
+                    url: e.url.clone(),
+                    network,
+                    chunks,
+                    total_size: e.total_bytes,
+                    output_dir: output_dir.clone(),
+                    partial_path: partial_path.clone(),
+                    temp_dir,
+                }),
+                partial_path,
+            });
+        }
+
         self.history = normalized;
         unfinished
     }
@@ -989,18 +1579,51 @@ impl App {
         self.last_history_save = Some(Instant::now());
     }
 
-    /// Called once before exit: running transfers are marked interrupted so
-    /// the log tells the truth after relaunch.
+    /// Called once before exit: running transfers are marked paused so
+    /// their partial data survives and can be resumed on next launch.
     pub fn shutdown_mark(&mut self) {
         for i in 0..self.downloads.len() {
             if self.downloads[i].status == DownloadStatus::InProgress {
-                self.downloads[i].status = DownloadStatus::Failed("interrupted by exit".into());
-                self.touch_history(
-                    i,
-                    Some(history::ST_FAILED),
-                    Some("interrupted by exit".to_string()),
-                    None,
-                );
+                let dl = &self.downloads[i];
+                let partial_path = dl.partial_path.clone();
+
+                // Build resume_info using the actual output directory from
+                // history so resume after restart finds the right scratch files.
+                let output_dir = dl
+                    .history_id
+                    .as_ref()
+                    .and_then(|hid| {
+                        self.history
+                            .iter()
+                            .find(|e| Some(&e.id) == Some(hid))
+                            .map(|e| {
+                                e.dir
+                                    .as_ref()
+                                    .map(PathBuf::from)
+                                    .unwrap_or_else(|| self.settings.output_dir.clone())
+                            })
+                    })
+                    .unwrap_or_else(|| self.settings.output_dir.clone());
+
+                let temp_dir = dl.history_id.as_ref().and_then(|hid| {
+                    self.history
+                        .iter()
+                        .find(|e| &e.id == hid)
+                        .and_then(|e| e.temp_dir.as_ref().map(PathBuf::from))
+                        .or_else(|| Some(downloader::tmp_dir_for(&output_dir, hid)))
+                });
+
+                self.downloads[i].resume_info = Some(ResumeInfo {
+                    url: dl.url.clone(),
+                    network: dl.network.clone(),
+                    chunks: dl.chunks,
+                    total_size: dl.total_bytes,
+                    output_dir,
+                    partial_path: partial_path.clone(),
+                    temp_dir,
+                });
+                self.downloads[i].status = DownloadStatus::Paused;
+                self.touch_history(i, Some(history::ST_PAUSED), None, partial_path);
             }
         }
         self.persist_if_due(true);
@@ -1456,6 +2079,7 @@ mod tests {
             id,
             filename: "a.bin".into(),
             total_bytes: Some(100),
+            filepath: PathBuf::from("/tmp/a.bin"),
         });
         let _ = app.progress_tx.send(DownloadProgress::Completed {
             id,
@@ -1498,11 +2122,14 @@ mod tests {
             id: id.into(),
             url: format!("http://x.onion/{}.bin", id),
             filename: format!("{}.bin", id),
+            category: "Other".into(),
             filepath: None,
             dir: None,
+            temp_dir: None,
             network: "tor".into(),
             total_bytes: Some(10),
             downloaded_bytes: 5,
+            chunks: 1,
             status: status.into(),
             error: None,
             added_at: "2026-08-25 00:00".into(),
@@ -1511,7 +2138,7 @@ mod tests {
     }
 
     #[test]
-    fn load_history_normalizes_stale_states_to_interrupted() {
+    fn load_history_recovers_running_as_paused() {
         let mut app = test_app();
         let dir = std::env::temp_dir().join(format!("odo_app_{}", history::new_id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -1519,7 +2146,7 @@ mod tests {
         let entries = vec![
             make_entry("1", history::ST_COMPLETED),
             make_entry("2", history::ST_IN_PROGRESS),
-            make_entry("3", "paused"),
+            make_entry("3", history::ST_PAUSED),
             make_entry("4", history::ST_FAILED),
         ];
         history::save_to(&path, &entries).unwrap();
@@ -1527,9 +2154,12 @@ mod tests {
         app.history_file = Some(path.clone());
         let unfinished = app.load_history();
 
-        assert_eq!(unfinished, 3);
-        assert_eq!(app.history[1].error.as_deref(), Some("interrupted by exit"));
-        assert_eq!(app.history[2].status, history::ST_FAILED);
+        // A stale running entry is made resumable instead of being discarded.
+        assert_eq!(unfinished, 1);
+        assert_eq!(app.history[1].status, history::ST_PAUSED);
+        // Entry 3 was already paused and survives the reload unchanged.
+        assert_eq!(app.history[2].status, history::ST_PAUSED);
+        // Entry 4 was already failed.
         assert_eq!(app.history[3].status, history::ST_FAILED);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1570,13 +2200,11 @@ mod tests {
         );
         app.shutdown_mark();
 
-        assert!(matches!(
-            app.downloads[id].status,
-            DownloadStatus::Failed(_)
-        ));
-        assert_eq!(app.history[0].status, history::ST_FAILED);
+        // On exit, running transfers are paused (resumable), not failed.
+        assert!(matches!(app.downloads[id].status, DownloadStatus::Paused));
+        assert_eq!(app.history[0].status, history::ST_PAUSED);
         let loaded = history::load_from(&path);
-        assert_eq!(loaded[0].status, history::ST_FAILED);
+        assert_eq!(loaded[0].status, history::ST_PAUSED);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

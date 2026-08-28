@@ -22,7 +22,13 @@
 | 🎨 **Cyberpunk TUI** | Neon magenta/cyan/green aesthetic powered by `ratatui` |
 | 🧅 **Tor Native** | SOCKS5 proxy support for `.onion` URLs via `reqwest` |
 | ⚡ **Parallel Downloads** | Up to 100 concurrent connections for maximum speed |
-| ⏸ **Pause/Resume** | Press `Space` to pause and resume any active download |
+| ⏸ **Pause/Resume** | Press `Space` to pause/resume. Paused downloads survive a restart and resume from where they left off via HTTP Range requests |
+| ⏳ **Download Queue** | Keeps up to 3 downloads active and queues the rest automatically |
+| 🔁 **Automatic Retry** | Retries transient failures up to 3 times while preserving partial data |
+| ♻️ **Manual Retry** | Press `Space` or `R` on a failed download to retry from its saved partial data |
+| 🗂 **Smart Categories** | Automatically labels videos, music, documents, programs, archives, and other files |
+| 🔎 **Quick Search** | Press `/` in Downloads or History to filter by filename, URL, or category |
+| 🎛 **Batch Controls** | `P` pauses all active downloads, `U` resumes paused items, and `Y` retries failures |
 | 📊 **Live Progress** | Real-time progress bars with speed, ETA, and byte count |
 | 📋 **Activity Log** | Timestamped events with colored status indicators |
 | ⚙ **Configurable** | CLI args + optional TOML config file |
@@ -146,6 +152,11 @@ oniondownoda --verbose
 | `Enter` | Start download from URL input |
 | `Tab` | Switch focus between Input and Downloads |
 | `Space` | Pause / Resume selected download |
+| `R` | Retry selected failed download |
+| `/` | Search/filter Downloads and History |
+| `P` | Pause all active downloads |
+| `U` | Resume all paused downloads |
+| `Y` | Retry all failed downloads |
 | `↑` / `↓` | Scroll downloads or log |
 | `PgUp` / `PgDn` | Scroll log faster |
 | `Esc` | Quit |
@@ -179,7 +190,7 @@ verbose = true
 | State | Icon | Description |
 |-------|:----:|-------------|
 | In Progress | ⏳ | Actively downloading with live progress bar |
-| Paused | ⏸ | Paused — press `Space` to resume |
+| Paused | ⏸ | Paused — press `Space` to resume; partial data is kept and continued on restart |
 | Completed | ✅ | Finished successfully |
 | Failed | ❌ | Error occurred — check log for details |
 

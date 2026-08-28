@@ -1,5 +1,6 @@
 use crate::app::{
-    format_bytes, App, AppMode, DialogFocus, DownloadStatus, Focus, NetworkMode, SettingsField,
+    format_bytes, App, AppMode, DialogFocus, DownloadCategory, DownloadStatus, Focus, NetworkMode,
+    SettingsField,
 };
 use crate::banner::BANNER;
 use crate::history;
@@ -22,6 +23,17 @@ const GRAY: Color = Color::Rgb(180, 180, 180);
 const DIM_GRAY: Color = Color::Rgb(80, 80, 80);
 const DARK_BG: Color = Color::Rgb(0, 0, 0);
 const SURFACE: Color = Color::Rgb(10, 10, 10);
+
+fn category_color(category: DownloadCategory) -> Color {
+    match category {
+        DownloadCategory::Video => Color::Rgb(255, 105, 180),
+        DownloadCategory::Music => Color::Rgb(170, 120, 255),
+        DownloadCategory::Documents => CYAN,
+        DownloadCategory::Programs => YELLOW,
+        DownloadCategory::Archives => GREEN,
+        DownloadCategory::Other => GRAY,
+    }
+}
 
 /// Column offset pieces of the editable path text inside the save dialog.
 const DIALOG_PATH_LABEL: &str = "💾 Save to:  ";
@@ -80,6 +92,10 @@ pub fn draw(frame: &mut Frame, app: &App) {
         draw_help(frame, size);
     } else if app.mode == AppMode::Settings {
         draw_settings(frame, app, size);
+    }
+
+    if app.search_mode {
+        draw_search_overlay(frame, app, size);
     }
 }
 
@@ -181,6 +197,22 @@ fn draw_tor_status(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         )
     };
 
+    let active = app
+        .downloads
+        .iter()
+        .filter(|dl| matches!(dl.status, DownloadStatus::InProgress))
+        .count();
+    let queued = app
+        .downloads
+        .iter()
+        .filter(|dl| matches!(dl.status, DownloadStatus::Queued))
+        .count();
+    let completed = app
+        .downloads
+        .iter()
+        .filter(|dl| matches!(dl.status, DownloadStatus::Completed))
+        .count();
+
     let line = Line::from(vec![
         Span::styled(
             "  🧅 Tor Status: ",
@@ -188,6 +220,13 @@ fn draw_tor_status(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         ),
         Span::styled(icon, Style::default().fg(color)),
         Span::styled(text, Style::default().fg(color)),
+        Span::styled(
+            format!(
+                "    ● {} active   ◷ {} queued   ✓ {} done",
+                active, queued, completed
+            ),
+            Style::default().fg(GRAY),
+        ),
     ]);
 
     let block = Block::default()
@@ -196,6 +235,42 @@ fn draw_tor_status(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         .style(Style::default().bg(SURFACE));
 
     frame.render_widget(Paragraph::new(line).block(block), area);
+}
+
+fn draw_search_overlay(frame: &mut Frame, app: &App, area: Rect) {
+    let width = area.width.saturating_sub(12).min(76).max(32);
+    let height = 3;
+    let popup = Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + 2,
+        width,
+        height,
+    };
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .title(Span::styled(
+            " 🔎 Filter downloads and history ",
+            Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(CYAN))
+        .style(Style::default().bg(DARK_BG));
+    let inner = block.inner(popup);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                " / ",
+                Style::default().fg(MAGENTA).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(&app.search_query, Style::default().fg(WHITE)),
+            Span::styled("  (Enter apply · Esc clear)", Style::default().fg(DIM_GRAY)),
+        ]))
+        .block(block),
+        popup,
+    );
+    let cursor = app.search_cursor.min(app.search_query.len());
+    let text_width = unicode_width::UnicodeWidthStr::width(&app.search_query[..cursor]) as u16;
+    frame.set_cursor_position((inner.x + 3 + text_width, inner.y));
 }
 
 fn draw_input(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
@@ -249,15 +324,35 @@ fn draw_downloads(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         Style::default().fg(MAGENTA).add_modifier(Modifier::BOLD)
     };
 
+    let visible = app
+        .downloads
+        .iter()
+        .enumerate()
+        .filter(|(id, _)| app.download_matches_search(*id))
+        .count();
+    let title = if app.search_query.is_empty() {
+        format!(" 📥 Downloads ({}) ", app.downloads.len())
+    } else {
+        format!(
+            " 📥 Downloads {}/{} · /{} ",
+            visible,
+            app.downloads.len(),
+            app.search_query
+        )
+    };
     let block = Block::default()
-        .title(Span::styled(" 📥 Downloads ", title_style))
+        .title(Span::styled(title, title_style))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(if focused { CYAN } else { MAGENTA }))
         .style(Style::default().bg(SURFACE));
 
-    if app.downloads.is_empty() {
+    if app.downloads.is_empty() || visible == 0 {
         let empty = Paragraph::new(Line::from(Span::styled(
-            "  No active downloads — paste a URL above and hit Enter",
+            if app.downloads.is_empty() {
+                "  No active downloads — paste a URL above and hit Enter"
+            } else {
+                "  No downloads match the current search"
+            },
             Style::default().fg(DIM_GRAY).add_modifier(Modifier::ITALIC),
         )))
         .block(block);
@@ -271,6 +366,9 @@ fn draw_downloads(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let mut lines = Vec::new();
 
     for (i, dl) in app.downloads.iter().enumerate() {
+        if !app.download_matches_search(i) {
+            continue;
+        }
         let is_selected = app.selected_download == i;
         let prefix = if is_selected { "> " } else { "  " };
         let base_style = if is_selected {
@@ -281,6 +379,8 @@ fn draw_downloads(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 
         let icon = match &dl.status {
             DownloadStatus::InProgress => "⏳",
+            DownloadStatus::Paused => "⏸",
+            DownloadStatus::Queued => "⏱",
             DownloadStatus::Completed => "✅",
             DownloadStatus::Failed(_) => "❌",
         };
@@ -289,7 +389,13 @@ fn draw_downloads(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
             Span::styled(format!("{}{} ", prefix, icon), Style::default().fg(WHITE)),
             Span::styled(&dl.filename, base_style.fg(WHITE)),
             Span::styled(
-                format!("  [{} | {} conn]", dl.network.label(), dl.chunks),
+                format!("  [{}]", dl.category.label()),
+                Style::default()
+                    .fg(category_color(dl.category))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" [{} | {} conn]", dl.network.label(), dl.chunks),
                 Style::default().fg(DIM_GRAY).add_modifier(Modifier::ITALIC),
             ),
         ]));
@@ -334,6 +440,33 @@ fn draw_downloads(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
                     ]));
                 }
             }
+            DownloadStatus::Paused => {
+                let ratio = if let Some(total) = dl.total_bytes {
+                    if total > 0 {
+                        dl.downloaded_bytes as f64 / total as f64
+                    } else {
+                        0.0
+                    }
+                } else {
+                    0.0
+                };
+                let bar_width = (inner.width as usize).saturating_sub(30).max(10);
+                let filled = (ratio * bar_width as f64) as usize;
+                let empty = bar_width.saturating_sub(filled);
+                let pct = (ratio * 100.0) as u32;
+                lines.push(Line::from(vec![
+                    Span::styled("   ", Style::default()),
+                    Span::styled("█".repeat(filled), Style::default().fg(YELLOW)),
+                    Span::styled("░".repeat(empty), Style::default().fg(DIM_GRAY)),
+                    Span::styled(format!(" {:>3}%  PAUSED", pct), Style::default().fg(YELLOW)),
+                ]));
+            }
+            DownloadStatus::Queued => {
+                lines.push(Line::from(Span::styled(
+                    "   ⏳ Waiting in queue",
+                    Style::default().fg(YELLOW),
+                )));
+            }
             DownloadStatus::Completed => {
                 lines.push(Line::from(Span::styled(
                     format!("   ✓ Done ({})", format_bytes(dl.downloaded_bytes)),
@@ -342,7 +475,7 @@ fn draw_downloads(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
             }
             DownloadStatus::Failed(err) => {
                 lines.push(Line::from(Span::styled(
-                    format!("   ✗ {}", err),
+                    format!("   ✗ {}  [R/Space retry]", err),
                     Style::default().fg(Color::Red),
                 )));
             }
@@ -364,6 +497,7 @@ fn history_status_visual(status: &str) -> (&'static str, Color) {
     match status {
         history::ST_IN_PROGRESS => ("⏳", CYAN),
         history::ST_COMPLETED => ("✅", GREEN),
+        history::ST_QUEUED => ("⏱", YELLOW),
         history::ST_FAILED => ("❌", Color::Red),
         _ => ("•", GRAY),
     }
@@ -377,17 +511,31 @@ fn draw_history(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         Style::default().fg(MAGENTA).add_modifier(Modifier::BOLD)
     };
 
+    let visible = app
+        .history
+        .iter()
+        .enumerate()
+        .filter(|(id, _)| app.history_matches_search(*id))
+        .count();
     let unfinished = app
         .history
         .iter()
-        .filter(|e| e.status != history::ST_COMPLETED)
+        .enumerate()
+        .filter(|(id, e)| app.history_matches_search(*id) && e.status != history::ST_COMPLETED)
         .count();
+    let history_title = if app.search_query.is_empty() {
+        format!(" 📜 History ({}) ", app.history.len())
+    } else {
+        format!(
+            " 📜 History {}/{} · /{} ",
+            visible,
+            app.history.len(),
+            app.search_query
+        )
+    };
 
     let block = Block::default()
-        .title(Span::styled(
-            format!(" 📜 History ({}) ", app.history.len()),
-            title_style,
-        ))
+        .title(Span::styled(history_title, title_style))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(if focused { CYAN } else { MAGENTA }))
         .style(Style::default().bg(SURFACE));
@@ -401,14 +549,18 @@ fn draw_history(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     frame.render_widget(block, area);
 
     let hint = Paragraph::new(Line::from(Span::styled(
-        " ↑↓ select · D delete · Tab back",
+        " ↑↓ select · R retry failed · D delete · Tab back",
         Style::default().fg(DIM_GRAY),
     )));
     frame.render_widget(hint, rows[1]);
 
-    if app.history.is_empty() {
+    if app.history.is_empty() || visible == 0 {
         let empty = Paragraph::new(Line::from(Span::styled(
-            "  Nothing yet — finished and interrupted downloads appear here",
+            if app.history.is_empty() {
+                "  Nothing yet — finished and interrupted downloads appear here"
+            } else {
+                "  No history entries match the current search"
+            },
             Style::default().fg(DIM_GRAY).add_modifier(Modifier::ITALIC),
         )));
         frame.render_widget(empty, rows[0]);
@@ -426,6 +578,9 @@ fn draw_history(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     }
 
     for (i, entry) in app.history.iter().enumerate() {
+        if !app.history_matches_search(i) {
+            continue;
+        }
         let is_selected = app.history_selected == i;
         let prefix = if is_selected { "> " } else { "  " };
         let (icon, color) = history_status_visual(&entry.status);
@@ -457,6 +612,17 @@ fn draw_history(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         lines.push(Line::from(vec![
             Span::styled(format!("{}{} ", prefix, icon), Style::default().fg(color)),
             Span::styled(entry.filename.clone(), base_style),
+            Span::styled(
+                format!(
+                    "  [{}]",
+                    if entry.category.is_empty() {
+                        "Other"
+                    } else {
+                        &entry.category
+                    }
+                ),
+                Style::default().fg(category_color(DownloadCategory::parse(&entry.category))),
+            ),
             Span::styled(format!("  {}", size_part), Style::default().fg(CYAN)),
             Span::styled(
                 format!("  [{}]", entry.network.to_uppercase()),
@@ -590,6 +756,14 @@ fn draw_disclaimer_and_help(frame: &mut Frame, app: &App, area: ratatui::layout:
             Span::styled(" Settings  ", Style::default().fg(WHITE)),
             k("[H]"),
             Span::styled(" Help  ", Style::default().fg(WHITE)),
+            k("[Space]"),
+            Span::styled(" Pause/Resume  ", Style::default().fg(WHITE)),
+            k("[/]"),
+            Span::styled(" Search  ", Style::default().fg(WHITE)),
+            k("[P/U]"),
+            Span::styled(" Pause/Resume all  ", Style::default().fg(WHITE)),
+            k("[Y]"),
+            Span::styled(" Retry all  ", Style::default().fg(WHITE)),
             Span::styled(
                 format!("▸ {}", focus_label),
                 Style::default().fg(MAGENTA).add_modifier(Modifier::BOLD),
@@ -839,6 +1013,14 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         (
             "📋 Log Output:",
             "Errors and start states log in the bottom console matrix.",
+        ),
+        (
+            "🔎 Search:",
+            "From Downloads or History, press / and type a filename, URL, or category.",
+        ),
+        (
+            "🎛 Batch Actions:",
+            "P pauses active items, U resumes paused items, and Y retries failed items.",
         ),
     ];
 

@@ -4,6 +4,8 @@ use time::OffsetDateTime;
 
 pub const ST_IN_PROGRESS: &str = "in_progress";
 pub const ST_COMPLETED: &str = "completed";
+pub const ST_PAUSED: &str = "paused";
+pub const ST_QUEUED: &str = "queued";
 pub const ST_FAILED: &str = "failed";
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -11,6 +13,9 @@ pub struct HistoryEntry {
     pub id: String,
     pub url: String,
     pub filename: String,
+    /// Automatic category used by the TUI filter and display.
+    #[serde(default)]
+    pub category: String,
     /// Final file path once known (set on completion; points at the partial
     /// file for interrupted single-stream downloads so they can be resumed).
     #[serde(default)]
@@ -19,24 +24,34 @@ pub struct HistoryEntry {
     /// even if the default download folder changes later.
     #[serde(default)]
     pub dir: Option<String>,
+    /// Exact scratch directory used for parallel chunks. This is persisted
+    /// separately from `dir` so resume never has to reconstruct a path that
+    /// may have changed between sessions.
+    #[serde(default)]
+    pub temp_dir: Option<String>,
     /// "tor" | "normal"
     pub network: String,
     #[serde(default)]
     pub total_bytes: Option<u64>,
     #[serde(default)]
     pub downloaded_bytes: u64,
+    /// Connection count used for this transfer, so a resumed download keeps
+    /// the same chunk layout instead of silently shrinking to one stream.
+    #[serde(default)]
+    pub chunks: usize,
     pub status: String,
     #[serde(default)]
     pub error: Option<String>,
     pub added_at: String,
     pub updated_at: String,
 }
-
 impl HistoryEntry {
     pub fn status_label(&self) -> &'static str {
         match self.status.as_str() {
             ST_IN_PROGRESS => "IN PROGRESS",
             ST_COMPLETED => "COMPLETED",
+            ST_PAUSED => "PAUSED",
+            ST_QUEUED => "QUEUED",
             ST_FAILED => "FAILED",
             _ => "UNKNOWN",
         }
@@ -136,11 +151,14 @@ mod tests {
             id: id.into(),
             url: "http://example.onion/file.zip".into(),
             filename: "file.zip".into(),
+            category: "Archives".into(),
             filepath: None,
             dir: None,
+            temp_dir: None,
             network: "tor".into(),
             total_bytes: Some(1024),
             downloaded_bytes: 512,
+            chunks: 1,
             status: status.into(),
             error: None,
             added_at: "2026-08-25 10:00".into(),
